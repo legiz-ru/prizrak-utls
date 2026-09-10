@@ -3,6 +3,7 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -12,6 +13,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/utls/internal/circl/sign/mldsa/mldsa65"
 	"github.com/metacubex/utls/internal/ratelimit"
 	"github.com/metacubex/utls/mlkem"
 
@@ -106,6 +109,7 @@ type RealityConfig struct {
 	PrivateKey   []byte
 	MinClientVer []byte
 	MaxClientVer []byte
+	Mldsa65Key   []byte
 	MaxTimeDiff  time.Duration
 	ShortIds     map[[8]byte]bool
 
@@ -197,10 +201,17 @@ func onceValues[T1, T2 any](f func() (T1, T2)) func() (T1, T2) {
 	}
 }
 
-var realityServerCert = onceValues(func() (ed25519Priv ed25519.PrivateKey, signedCert []byte) {
+type realityServerCertificates struct {
+	plain   []byte
+	mldsa65 []byte
+}
+
+var realityServerCert = onceValues(func() (ed25519Priv ed25519.PrivateKey, certs realityServerCertificates) {
 	certificate := x509.Certificate{SerialNumber: &big.Int{}}
+	certificateMldsa65 := x509.Certificate{SerialNumber: &big.Int{}, ExtraExtensions: []pkix.Extension{{Id: []int{0, 0}, Value: make([]byte, mldsa65.SignatureSize)}}}
 	_, ed25519Priv, _ = ed25519.GenerateKey(rand.Reader)
-	signedCert, _ = x509.CreateCertificate(rand.Reader, &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+	certs.plain, _ = x509.CreateCertificate(rand.Reader, &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+	certs.mldsa65, _ = x509.CreateCertificate(rand.Reader, &certificateMldsa65, &certificateMldsa65, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
 	return
 })
 
@@ -269,12 +280,26 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 		}
 	*/
 	{
-		ed25519Priv, signedCert := realityServerCert()
-		signedCert = append([]byte{}, signedCert...)
+		ed25519Priv, certs := realityServerCert()
+		signedCert := bytes.Clone(certs.plain)
+		if len(config.Mldsa65Key) > 0 {
+			signedCert = bytes.Clone(certs.mldsa65)
+		}
 
 		h := hmac.New(sha512.New, hs.AuthKey)
 		h.Write(ed25519Priv[32:])
 		h.Sum(signedCert[:len(signedCert)-64])
+		if len(config.Mldsa65Key) > 0 {
+			h.Write(hs.clientHello.original)
+			h.Write(hs.hello.original)
+			privateKey := new(mldsa65.PrivateKey)
+			if err := privateKey.UnmarshalBinary(config.Mldsa65Key); err != nil {
+				return fmt.Errorf("REALITY: invalid ML-DSA-65 private key: %w", err)
+			}
+			if err := mldsa65.SignTo(privateKey, h.Sum(nil), nil, false, signedCert[126:]); err != nil {
+				return fmt.Errorf("REALITY: sign ML-DSA-65 certificate extension: %w", err)
+			}
+		}
 
 		hs.cert = &Certificate{
 			Certificate: [][]byte{signedCert},
@@ -652,4 +677,22 @@ func NewRealityListener(inner net.Listener, config *RealityConfig) net.Listener 
 		}()
 	}
 	return l
+}
+
+func RealityMldsa65KeyFromSeed(seed []byte) (privateKey, publicKey []byte, err error) {
+	if len(seed) != mldsa65.SeedSize {
+		return nil, nil, fmt.Errorf("ML-DSA-65 seed length is %d, want %d", len(seed), mldsa65.SeedSize)
+	}
+	var seedArray [mldsa65.SeedSize]byte
+	copy(seedArray[:], seed)
+	public, private := mldsa65.NewKeyFromSeed(&seedArray)
+	return private.Bytes(), public.Bytes(), nil
+}
+
+func RealityMldsa65Verify(publicKey, message, signature []byte) bool {
+	key := new(mldsa65.PublicKey)
+	if err := key.UnmarshalBinary(publicKey); err != nil {
+		return false
+	}
+	return mldsa65.Verify(key, message, nil, signature)
 }
