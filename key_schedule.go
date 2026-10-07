@@ -8,6 +8,7 @@ import (
 	"crypto/ecdh"
 	"crypto/hmac"
 	"errors"
+	fips140 "github.com/metacubex/utls/internal/fips140compat"
 	"hash"
 	"io"
 
@@ -75,16 +76,16 @@ type keyExchange interface {
 }
 
 func keyExchangeForCurveID(id CurveID) (keyExchange, error) {
-	newMLKEMPrivateKey768 := func(b []byte) (mlkem.Decapsulator, error) {
-		return mlkem.NewDecapsulationKey768(b)
+	mlkemGenerateKey768 := func() (mlkem.Decapsulator, error) {
+		return mlkem.GenerateKey768()
 	}
-	newMLKEMPrivateKey1024 := func(b []byte) (mlkem.Decapsulator, error) {
-		return mlkem.NewDecapsulationKey1024(b)
+	mlkemGenerateKey1024 := func() (mlkem.Decapsulator, error) {
+		return mlkem.GenerateKey1024()
 	}
-	newMLKEMPublicKey768 := func(b []byte) (mlkem.Encapsulator, error) {
+	mlkemNewPublicKey768 := func(b []byte) (mlkem.Encapsulator, error) {
 		return mlkem.NewEncapsulationKey768(b)
 	}
-	newMLKEMPublicKey1024 := func(b []byte) (mlkem.Encapsulator, error) {
+	mlkemNewPublicKey1024 := func(b []byte) (mlkem.Encapsulator, error) {
 		return mlkem.NewEncapsulationKey1024(b)
 	}
 	switch id {
@@ -99,24 +100,52 @@ func keyExchangeForCurveID(id CurveID) (keyExchange, error) {
 	case X25519MLKEM768:
 		return &hybridKeyExchange{id, ecdhKeyExchange{X25519, ecdh.X25519()},
 			32, mlkem.EncapsulationKeySize768, mlkem.CiphertextSize768,
-			newMLKEMPrivateKey768, newMLKEMPublicKey768}, nil
+			mlkemGenerateKey768, mlkemNewPublicKey768}, nil
 	case SecP256r1MLKEM768:
 		return &hybridKeyExchange{id, ecdhKeyExchange{CurveP256, ecdh.P256()},
 			65, mlkem.EncapsulationKeySize768, mlkem.CiphertextSize768,
-			newMLKEMPrivateKey768, newMLKEMPublicKey768}, nil
+			mlkemGenerateKey768, mlkemNewPublicKey768}, nil
 	case SecP384r1MLKEM1024:
 		return &hybridKeyExchange{id, ecdhKeyExchange{CurveP384, ecdh.P384()},
 			97, mlkem.EncapsulationKeySize1024, mlkem.CiphertextSize1024,
-			newMLKEMPrivateKey1024, newMLKEMPublicKey1024}, nil
-	//[uTLS] SECTION START
+			mlkemGenerateKey1024, mlkemNewPublicKey1024}, nil
+	// [uTLS] Keep the legacy Kyber draft group and its wire ordering.
 	case X25519Kyber768Draft00:
 		return &hybridKeyExchange{id, ecdhKeyExchange{X25519, ecdh.X25519()},
 			32, mlkem.EncapsulationKeySize768, mlkem.CiphertextSize768,
-			newMLKEMPrivateKey768, newMLKEMPublicKey768}, nil
-	//[uTLS] SECTION END
+			mlkemGenerateKey768, mlkemNewPublicKey768}, nil
+	case MLKEM1024:
+		return &mlkem1024KeyExchange{}, nil
 	default:
 		return nil, errors.New("tls: unsupported key exchange")
 	}
+}
+
+type mlkem1024KeyExchange struct{}
+
+func (ke *mlkem1024KeyExchange) keyShares(_ io.Reader) (*keySharePrivateKeys, []keyShare, error) {
+	priv, err := mlkem.GenerateKey1024()
+	if err != nil {
+		return nil, nil, err
+	}
+	return &keySharePrivateKeys{mlkem: priv}, []keyShare{{MLKEM1024, priv.EncapsulationKey().Bytes()}}, nil
+}
+
+func (ke *mlkem1024KeyExchange) serverSharedSecret(_ io.Reader, clientKeyShare []byte) ([]byte, keyShare, error) {
+	peerKey, err := mlkem.NewEncapsulationKey1024(clientKeyShare)
+	if err != nil {
+		return nil, keyShare{}, err
+	}
+	sharedKey, keyShareData := peerKey.Encapsulate()
+	return sharedKey, keyShare{MLKEM1024, keyShareData}, nil
+}
+
+func (ke *mlkem1024KeyExchange) clientSharedSecret(priv *keySharePrivateKeys, serverKeyShare []byte) ([]byte, error) {
+	sharedKey, err := priv.mlkem.Decapsulate(serverKeyShare)
+	if err != nil {
+		return nil, err
+	}
+	return sharedKey, nil
 }
 
 type ecdhKeyExchange struct {
@@ -186,20 +215,23 @@ type hybridKeyExchange struct {
 	mlkemPublicKeySize  int
 	mlkemCiphertextSize int
 
-	newMLKEMPrivateKey func([]byte) (mlkem.Decapsulator, error)
-	newMLKEMPublicKey  func([]byte) (mlkem.Encapsulator, error)
+	mlkemGenerateKey  func() (mlkem.Decapsulator, error)
+	mlkemNewPublicKey func([]byte) (mlkem.Encapsulator, error)
 }
 
 func (ke *hybridKeyExchange) keyShares(rand io.Reader) (*keySharePrivateKeys, []keyShare, error) {
-	priv, ecdhShares, err := ke.ecdh.keyShares(rand)
+	var (
+		priv       *keySharePrivateKeys
+		ecdhShares []keyShare
+		err        error
+	)
+	fips140.WithoutEnforcement(func() { // Hybrid of ML-KEM, which is Approved.
+		priv, ecdhShares, err = ke.ecdh.keyShares(rand)
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	seed := make([]byte, mlkem.SeedSize)
-	if _, err := io.ReadFull(rand, seed); err != nil {
-		return nil, nil, err
-	}
-	priv.mlkem, err = ke.newMLKEMPrivateKey(seed)
+	priv.mlkem, err = ke.mlkemGenerateKey()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -227,11 +259,18 @@ func (ke *hybridKeyExchange) serverSharedSecret(rand io.Reader, clientKeyShare [
 		ecdhShareData = clientKeyShare[:ke.ecdhElementSize]
 		mlkemShareData = clientKeyShare[ke.ecdhElementSize:]
 	}
-	ecdhSharedSecret, ks, err := ke.ecdh.serverSharedSecret(rand, ecdhShareData)
+	var (
+		ecdhSharedSecret []byte
+		ks               keyShare
+		err              error
+	)
+	fips140.WithoutEnforcement(func() { // Hybrid of ML-KEM, which is Approved.
+		ecdhSharedSecret, ks, err = ke.ecdh.serverSharedSecret(rand, ecdhShareData)
+	})
 	if err != nil {
 		return nil, keyShare{}, err
 	}
-	mlkemPeerKey, err := ke.newMLKEMPublicKey(mlkemShareData)
+	mlkemPeerKey, err := ke.mlkemNewPublicKey(mlkemShareData)
 	if err != nil {
 		return nil, keyShare{}, err
 	}
@@ -265,10 +304,15 @@ func (ke *hybridKeyExchange) clientSharedSecret(priv *keySharePrivateKeys, serve
 		ecdhShareData = serverKeyShare[:ke.ecdhElementSize]
 		mlkemShareData = serverKeyShare[ke.ecdhElementSize:]
 	}
-	//[uTLS] SECTION START
-	useSeperateEcdhe := ke.id == X25519Kyber768Draft00 || priv.mlkemEcdhe != nil
-	ecdhSharedSecret, err := ke.ecdh.clientSharedSecretChooseEcdhe(priv, ecdhShareData, useSeperateEcdhe)
-	//[uTLS] SECTION END
+	var (
+		ecdhSharedSecret []byte
+		err              error
+	)
+	fips140.WithoutEnforcement(func() { // Hybrid of ML-KEM, which is Approved.
+		// [uTLS] Browser presets can use independent hybrid/classical keys.
+		useSeperateEcdhe := ke.id == X25519Kyber768Draft00 || priv.mlkemEcdhe != nil
+		ecdhSharedSecret, err = ke.ecdh.clientSharedSecretChooseEcdhe(priv, ecdhShareData, useSeperateEcdhe)
+	})
 	if err != nil {
 		return nil, err
 	}

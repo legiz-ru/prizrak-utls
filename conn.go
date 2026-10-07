@@ -58,6 +58,7 @@ type Conn struct {
 	// activeCertHandles contains the cache handles to certificates in
 	// peerCertificates that are used to track active references.
 	activeCertHandles []*activeCert
+	localCertificate  [][]byte
 	// verifiedChains contains the certificate chains that we built, as
 	// opposed to the ones presented by the server.
 	verifiedChains [][]*x509.Certificate
@@ -747,7 +748,7 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 	}
 
-	if typ != recordTypeAlert && typ != recordTypeChangeCipherSpec && len(data) > 0 {
+	if (typ == recordTypeApplicationData || (typ == recordTypeHandshake && !handshakeComplete)) && len(data) > 0 {
 		// This is a state-advancing message: reset the retry count.
 		c.retryCount = 0
 	}
@@ -851,29 +852,6 @@ func (c *Conn) retryReadRecord(expectChangeCipherSpec bool) error {
 	return c.readRecordOrCCS(expectChangeCipherSpec)
 }
 
-// atLeastReader reads from R, stopping with EOF once at least N bytes have been
-// read. It is different from an io.LimitedReader in that it doesn't cut short
-// the last Read call, and in that it considers an early EOF an error.
-type atLeastReader struct {
-	R io.Reader
-	N int64
-}
-
-func (r *atLeastReader) Read(p []byte) (int, error) {
-	if r.N <= 0 {
-		return 0, io.EOF
-	}
-	n, err := r.R.Read(p)
-	r.N -= int64(n) // won't underflow unless len(p) >= n > 9223372036854775809
-	if r.N > 0 && err == io.EOF {
-		return n, io.ErrUnexpectedEOF
-	}
-	if r.N <= 0 && err == nil {
-		return n, io.EOF
-	}
-	return n, err
-}
-
 // readFromUntil reads from r into c.rawInput until c.rawInput contains
 // at least n bytes or else returns an error.
 func (c *Conn) readFromUntil(r io.Reader, n int) error {
@@ -881,12 +859,9 @@ func (c *Conn) readFromUntil(r io.Reader, n int) error {
 		return nil
 	}
 	needs := n - c.rawInput.Len()
-	// There might be extra input waiting on the wire. Make a best effort
-	// attempt to fetch it so that it can be used in (*Conn).Read to
-	// "predict" closeNotify alerts.
-	c.rawInput.Grow(needs + bytes.MinRead)
-	_, err := c.rawInput.ReadFrom(&atLeastReader{r, int64(needs)})
-	return err
+	// [prizrak] The read loop lives in u_readfrom_go121.go (upstream code,
+	// needs bytes.Buffer.AvailableBuffer from Go 1.21) and u_readfrom_go120.go.
+	return readAtLeast(&c.rawInput, r, needs)
 }
 
 // sendAlertLocked sends a TLS alert message.
@@ -1442,7 +1417,7 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 	}
 
 	newSecret := cipherSuite.nextTrafficSecret(c.in.trafficSecret)
-	if err := c.setReadTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret); err != nil {
+	if err := c.setReadTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret, keyUpdate.updateRequested); err != nil {
 		return err
 	}
 
@@ -1691,13 +1666,17 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 }
 
 // ConnectionState returns basic TLS details about the connection.
+//
+// The returned [ConnectionState] is only meaningful after the handshake has
+// completed, as reported by [ConnectionState.HandshakeComplete]; before then
+// its fields are not populated. The handshake is run automatically by the
+// first [Conn.Read] or [Conn.Write], or it can be triggered explicitly with
+// [Conn.Handshake].
 func (c *Conn) ConnectionState() ConnectionState {
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
 	return c.connectionStateLocked()
 }
-
-// var tlsunsafeekm = godebug.New("tlsunsafeekm") // [uTLS] unsupportted
 
 func (c *Conn) connectionStateLocked() ConnectionState {
 	var state ConnectionState
@@ -1712,6 +1691,7 @@ func (c *Conn) connectionStateLocked() ConnectionState {
 	state.ServerName = c.serverName
 	state.CipherSuite = c.cipherSuite
 	state.PeerCertificates = c.peerCertificates
+	state.LocalCertificate = c.localCertificate
 	state.VerifiedChains = c.verifiedChains
 	state.SignedCertificateTimestamps = c.scts
 	state.OCSPResponse = c.ocspResponse
@@ -1725,16 +1705,7 @@ func (c *Conn) connectionStateLocked() ConnectionState {
 	if c.config.Renegotiation != RenegotiateNever {
 		state.ekm = noEKMBecauseRenegotiation
 	} else if c.vers != VersionTLS13 && !c.extMasterSecret {
-		state.ekm = func(label string, context []byte, length int) ([]byte, error) {
-			// [uTLS SECTION START]
-			// Disabling unsupported godebug package
-			// if tlsunsafeekm.Value() == "1" {
-			// 	tlsunsafeekm.IncNonDefault()
-			// 	return c.ekm(label, context, length)
-			// }
-			// [uTLS SECTION END]
-			return noEKMBecauseNoEMS(label, context, length)
-		}
+		state.ekm = noEKMBecauseNoEMS
 	} else {
 		state.ekm = c.ekm
 	}
@@ -1781,12 +1752,16 @@ func (c *Conn) VerifyHostname(host string) error {
 // setReadTrafficSecret sets the read traffic secret for the given encryption level. If
 // being called at the same time as setWriteTrafficSecret, the caller must ensure the call
 // to setWriteTrafficSecret happens first so any alerts are sent at the write level.
-func (c *Conn) setReadTrafficSecret(suite *cipherSuiteTLS13, level QUICEncryptionLevel, secret []byte) error {
+func (c *Conn) setReadTrafficSecret(suite *cipherSuiteTLS13, level QUICEncryptionLevel, secret []byte, locked bool) error {
 	// Ensure that there are no buffered handshake messages before changing the
 	// read keys, since that can cause messages to be parsed that were encrypted
 	// using old keys which are no longer appropriate.
 	if c.hand.Len() != 0 {
-		c.sendAlert(alertUnexpectedMessage)
+		if locked {
+			c.sendAlertLocked(alertUnexpectedMessage)
+		} else {
+			c.sendAlert(alertUnexpectedMessage)
+		}
 		return errors.New("tls: handshake buffer not empty before setting read traffic secret")
 	}
 	c.in.setTrafficSecret(suite, level, secret)

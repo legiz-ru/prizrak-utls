@@ -70,6 +70,7 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 
 	switch CertCompressionAlgo(m.algorithm) {
 	case CertCompressionBrotli:
+		// [prizrak] keep andybalholm/brotli: go-brrr needs Go 1.22.
 		decompressed = brotli.NewReader(compressed)
 
 	case CertCompressionZlib:
@@ -101,8 +102,8 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 	rawMsg[2] = uint8(m.uncompressedLength >> 8)
 	rawMsg[3] = uint8(m.uncompressedLength)
 
-	n, err := decompressed.Read(rawMsg[4:])
-	if err != nil && !errors.Is(err, io.EOF) {
+	n, err := io.ReadFull(decompressed, rawMsg[4:])
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		c.sendAlert(alertBadCertificate)
 		return nil, err
 	}
@@ -112,6 +113,24 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 		// https://datatracker.ietf.org/doc/html/rfc8879#section-4
 		c.sendAlert(alertBadCertificate)
 		return nil, fmt.Errorf("decompressed len (%d) does not match specified len (%d)", n, m.uncompressedLength)
+	}
+	// Read through the end of the stream to detect excess output and terminal
+	// decoder errors that may be deferred until after the last output byte.
+	var extra [1]byte
+	n, err = io.ReadFull(decompressed, extra[:])
+	if n != 0 {
+		c.sendAlert(alertBadCertificate)
+		return nil, fmt.Errorf("decompressed len exceeds specified len (%d)", m.uncompressedLength)
+	}
+	if !errors.Is(err, io.EOF) {
+		c.sendAlert(alertBadCertificate)
+		return nil, err
+	}
+	// A decoder can stop at the end of its stream without consuming the rest
+	// of the compressed certificate message.
+	if compressed.Len() != 0 {
+		c.sendAlert(alertBadCertificate)
+		return nil, errors.New("trailing data after compressed certificate stream")
 	}
 	certMsg := new(certificateMsgTLS13)
 	if !certMsg.unmarshal(rawMsg) {
@@ -189,7 +208,7 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 		return nil, nil, nil, errors.New("tls: NextProtos values too large")
 	}
 
-	supportedVersions := config.supportedVersions(roleClient)
+	supportedVersions := config.supportedVersions(roleClient, c.quic != nil)
 	if len(supportedVersions) == 0 {
 		return nil, nil, nil, errors.New("tls: no supported versions satisfy MinVersion and MaxVersion")
 	}
@@ -250,8 +269,8 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 	}
 
 	if maxVersion >= VersionTLS12 {
-		hello.supportedSignatureAlgorithms = supportedSignatureAlgorithms(minVersion)
-		hello.supportedSignatureAlgorithmsCert = supportedSignatureAlgorithmsCert()
+		hello.supportedSignatureAlgorithms = supportedSignatureAlgorithms(minVersion, maxVersion)
+		hello.supportedSignatureAlgorithmsCert = supportedSignatureAlgorithmsCert(minVersion, maxVersion)
 	}
 
 	var keyShareKeys *keySharePrivateKeys
@@ -270,7 +289,7 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 		}
 
 		if len(hello.supportedCurves) == 0 {
-			return nil, nil, nil, errors.New("tls: no supported elliptic curves for ECDHE")
+			return nil, nil, nil, errors.New("tls: no supported key exchange methods (CurveIDs)")
 		}
 		// curveID := hello.supportedCurves[0]
 		// keyShareKeys = &keySharePrivateKeys{curveID: curveID}
@@ -539,7 +558,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	// If we are negotiating a protocol version that's lower than what we
 	// support, check for the server downgrade canaries.
 	// See RFC 8446, Section 4.1.3.
-	maxVers := c.config.maxSupportedVersion(roleClient)
+	maxVers := c.config.maxSupportedVersion(roleClient, c.quic != nil)
 	tls12Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS12
 	tls11Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS11
 	if maxVers == VersionTLS13 && c.vers <= VersionTLS12 && (tls12Downgrade || tls11Downgrade) ||

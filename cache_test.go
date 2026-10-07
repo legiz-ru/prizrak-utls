@@ -14,7 +14,7 @@ import (
 
 func TestCertCache(t *testing.T) {
 	cc := certCache{}
-	p, _ := pem.Decode([]byte(rsaCertPEM))
+	p, _ := pem.Decode([]byte(testRSA2048CertPEM))
 	if p == nil {
 		t.Fatal("Failed to decode certificate")
 	}
@@ -90,7 +90,7 @@ func TestCertCache(t *testing.T) {
 }
 
 func BenchmarkCertCache(b *testing.B) {
-	p, _ := pem.Decode([]byte(rsaCertPEM))
+	p, _ := pem.Decode([]byte(testRSA2048CertPEM))
 	if p == nil {
 		b.Fatal("Failed to decode certificate")
 	}
