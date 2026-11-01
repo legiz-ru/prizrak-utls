@@ -3297,6 +3297,8 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 							// only do this once for the first non-grease curve
 							uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = reusedKey
 							preferredCurveIsSet = true
+						} else {
+							uconn.HandshakeState.State13.KeyShareKeys.addEcdheFallback(curveID, reusedKey)
 						}
 						continue
 					}
@@ -3312,6 +3314,9 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 						// only do this once for the first non-grease curve
 						uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = ecdheKey
 						preferredCurveIsSet = true
+					} else {
+						// keep it: the server may select this key share
+						uconn.HandshakeState.State13.KeyShareKeys.addEcdheFallback(curveID, ecdheKey)
 					}
 				}
 			}

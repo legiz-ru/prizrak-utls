@@ -56,6 +56,12 @@ type keySharePrivateKeys struct {
 	mlkem mlkem.Decapsulator
 
 	mlkemEcdhe *ecdh.PrivateKey // [uTLS] seperate ecdhe key for pq keyshare in line with Chrome, instead of reusing ecdhe key like stdlib
+
+	// [uTLS] ecdheFallback keeps the private keys of the classical key shares
+	// after the first one, by group. A spec may send several (Firefox sends
+	// X25519 and P-256); ecdhe holds only the first, and a server may select
+	// any of them.
+	ecdheFallback map[CurveID]*ecdh.PrivateKey
 }
 
 // A keyExchange implements a TLS 1.3 KEM.

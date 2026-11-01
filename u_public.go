@@ -911,9 +911,19 @@ func (kpk *kemPrivateKey) ToPublic() *KemPrivateKey {
 
 type KeySharePrivateKeys struct {
 	// CurveID    CurveID
-	Ecdhe      *ecdh.PrivateKey
-	Mlkem      mlkem.Decapsulator
-	MlkemEcdhe *ecdh.PrivateKey
+	Ecdhe         *ecdh.PrivateKey
+	Mlkem         mlkem.Decapsulator
+	MlkemEcdhe    *ecdh.PrivateKey
+	EcdheFallback map[CurveID]*ecdh.PrivateKey // [uTLS] keys of the classical key shares after the first, by group
+}
+
+// [uTLS] addEcdheFallback keeps the private key of a classical key share
+// sent after the first one.
+func (ksp *KeySharePrivateKeys) addEcdheFallback(curveID CurveID, key *ecdh.PrivateKey) {
+	if ksp.EcdheFallback == nil {
+		ksp.EcdheFallback = make(map[CurveID]*ecdh.PrivateKey)
+	}
+	ksp.EcdheFallback[curveID] = key
 }
 
 func (ksp *KeySharePrivateKeys) ToPrivate() *keySharePrivateKeys {
@@ -922,9 +932,10 @@ func (ksp *KeySharePrivateKeys) ToPrivate() *keySharePrivateKeys {
 	}
 	return &keySharePrivateKeys{
 		// curveID:    ksp.CurveID,
-		ecdhe:      ksp.Ecdhe,
-		mlkem:      ksp.Mlkem,
-		mlkemEcdhe: ksp.MlkemEcdhe,
+		ecdhe:         ksp.Ecdhe,
+		mlkem:         ksp.Mlkem,
+		mlkemEcdhe:    ksp.MlkemEcdhe,
+		ecdheFallback: ksp.EcdheFallback,
 	}
 }
 
@@ -934,8 +945,9 @@ func (ksp *keySharePrivateKeys) ToPublic() *KeySharePrivateKeys {
 	}
 	return &KeySharePrivateKeys{
 		// CurveID:    ksp.curveID,
-		Ecdhe:      ksp.ecdhe,
-		Mlkem:      ksp.mlkem,
-		MlkemEcdhe: ksp.mlkemEcdhe,
+		Ecdhe:         ksp.ecdhe,
+		Mlkem:         ksp.mlkem,
+		MlkemEcdhe:    ksp.mlkemEcdhe,
+		EcdheFallback: ksp.ecdheFallback,
 	}
 }

@@ -286,3 +286,40 @@ func TestApplyPresetDoesNotMutateOriginalSpec(t *testing.T) {
 		}
 	}
 }
+
+func TestSecondaryKeyShareSelectedByServer(t *testing.T) {
+	// These fingerprints send key shares for X25519 and then P-256; only the
+	// first classical key used to be kept (refraction-networking/utls#402).
+	for _, helloID := range []ClientHelloID{HelloFirefox_105, HelloFirefox_120, HelloFirefox_148} {
+		t.Run(helloID.Str(), func(t *testing.T) {
+			serverConfig := testConfig.Clone()
+			serverConfig.CurvePreferences = []CurveID{CurveP256}
+
+			clientConfig := testConfig.Clone()
+			clientConfig.ServerName = "example.com"
+			clientConfig.InsecureSkipVerify = true
+
+			clientConn, serverConn := localPipe(t)
+			server := Server(serverConn, serverConfig)
+			client := UClient(clientConn, clientConfig, helloID)
+			defer server.Close()
+			defer client.Close()
+
+			serverErr := make(chan error, 1)
+			go func() { serverErr <- server.Handshake() }()
+			if err := client.Handshake(); err != nil {
+				t.Fatalf("client handshake: %v", err)
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatalf("server handshake: %v", err)
+			}
+
+			if curve := client.curveID; curve != CurveP256 {
+				t.Fatalf("negotiated %v, want P-256", curve)
+			}
+			if client.didHRR {
+				t.Fatal("unexpected HelloRetryRequest: the offered P-256 key share should have been used")
+			}
+		})
+	}
+}

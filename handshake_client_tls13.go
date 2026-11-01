@@ -589,7 +589,16 @@ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 		c.sendAlert(alertInternalError)
 		return err
 	}
-	sharedKey, err := ke.clientSharedSecret(hs.keyShareKeys, hs.serverHello.serverShare.data)
+	// [uTLS] SECTION START
+	keyShareKeys := hs.keyShareKeys
+	if key, ok := keyShareKeys.ecdheFallback[hs.serverHello.serverShare.group]; ok {
+		// The server selected a classical key share sent after the first.
+		selected := *keyShareKeys
+		selected.ecdhe = key
+		keyShareKeys = &selected
+	}
+	sharedKey, err := ke.clientSharedSecret(keyShareKeys, hs.serverHello.serverShare.data)
+	// [uTLS] SECTION END
 	if err != nil {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: invalid server key share")
