@@ -292,10 +292,10 @@ func TestSecondaryKeyShareSelectedByServer(t *testing.T) {
 	// first classical key used to be kept (refraction-networking/utls#402).
 	for _, helloID := range []ClientHelloID{HelloFirefox_105, HelloFirefox_120, HelloFirefox_148} {
 		t.Run(helloID.Str(), func(t *testing.T) {
-			serverConfig := testConfig.Clone()
+			serverConfig := testConfigServer.Clone()
 			serverConfig.CurvePreferences = []CurveID{CurveP256}
 
-			clientConfig := testConfig.Clone()
+			clientConfig := testConfigClient.Clone()
 			clientConfig.ServerName = "example.com"
 			clientConfig.InsecureSkipVerify = true
 
