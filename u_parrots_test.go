@@ -290,7 +290,7 @@ func TestApplyPresetDoesNotMutateOriginalSpec(t *testing.T) {
 func TestSecondaryKeyShareSelectedByServer(t *testing.T) {
 	// These fingerprints send key shares for X25519 and then P-256; only the
 	// first classical key used to be kept (refraction-networking/utls#402).
-	for _, helloID := range []ClientHelloID{HelloFirefox_105, HelloFirefox_120, HelloFirefox_148} {
+	for _, helloID := range []ClientHelloID{HelloFirefox_105, HelloFirefox_120, HelloFirefox_148, HelloFirefox_156} {
 		t.Run(helloID.Str(), func(t *testing.T) {
 			serverConfig := testConfigServer.Clone()
 			serverConfig.CurvePreferences = []CurveID{CurveP256}
