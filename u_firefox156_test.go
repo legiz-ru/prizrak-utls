@@ -51,9 +51,6 @@ func firefoxECH(t *testing.T, body []byte) (aead uint16, enc []byte, payloadLen 
 var firefox156ECHAEADs = []uint16{0x0001, 0x0003} // AES-128-GCM, ChaCha20-Poly1305
 
 func TestFirefox156CapturedClientHello(t *testing.T) {
-	if HelloFirefox_Auto != HelloFirefox_156 {
-		t.Fatalf("HelloFirefox_Auto = %s, want %s", HelloFirefox_Auto.Str(), HelloFirefox_156.Str())
-	}
 	testFirefoxCapturedClientHello(t, HelloFirefox_156, "testdata/firefox156_clienthellos.hex")
 }
 

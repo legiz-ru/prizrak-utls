@@ -9,6 +9,9 @@ import (
 )
 
 func TestFirefox160CapturedClientHello(t *testing.T) {
+	if HelloFirefox_Auto != HelloFirefox_160 {
+		t.Fatalf("HelloFirefox_Auto = %s, want %s", HelloFirefox_Auto.Str(), HelloFirefox_160.Str())
+	}
 	testFirefoxCapturedClientHello(t, HelloFirefox_160, "testdata/firefox160_clienthellos.hex")
 	// Firefox 160's fresh hello is 156's, so either matches both captures.
 	testFirefoxCapturedClientHello(t, HelloFirefox_156, "testdata/firefox160_clienthellos.hex")
