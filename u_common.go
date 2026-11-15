@@ -614,6 +614,9 @@ var (
 	HelloFirefox_120  = ClientHelloID{helloFirefox, "120", nil, nil}
 	HelloFirefox_148  = ClientHelloID{helloFirefox, "148", nil, nil}
 	HelloFirefox_156  = ClientHelloID{helloFirefox, "156", nil, nil}
+	// Firefox 160.0 on macOS, from captures of the browser. Its fresh
+	// ClientHello is the same as Firefox 156's.
+	HelloFirefox_160 = ClientHelloID{helloFirefox, "160", nil, nil}
 
 	HelloChrome_Auto        = HelloChrome_155
 	HelloChrome_58          = ClientHelloID{helloChrome, "58", nil, nil}

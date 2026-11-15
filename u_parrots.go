@@ -1667,11 +1667,18 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				},
 			},
 		}, nil
-	case HelloFirefox_156:
+	case HelloFirefox_156, HelloFirefox_160:
 		// Firefox 156.0 on macOS 26 as captured from the browser itself: 148
 		// without the ECDSA CBC suites and the FFDHE groups, with an empty
 		// session_ticket and psk_key_exchange_modes, and a GREASE ECH payload
-		// one byte longer.
+		// one byte longer. NSS draws the GREASE ECH enc as random bytes and
+		// sizes its payload for the encoded inner hello: 240 bytes for a
+		// host name of up to 107 bytes. Firefox 160.0 sends the same fresh
+		// ClientHello.
+		//
+		// A resumed Firefox hello drops session_ticket, ends with
+		// pre_shared_key and grows the GREASE ECH payload by the PSK. This
+		// spec offers no PSK, so it never resumes a TLS 1.3 session.
 		return ClientHelloSpec{
 			TLSVersMin: VersionTLS12,
 			TLSVersMax: VersionTLS13,
@@ -1792,7 +1799,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 							AeadId: dicttls.AEAD_CHACHA20_POLY1305,
 						},
 					},
-					CandidatePayloadLens: []uint16{224}, // +16: 240
+					CandidatePayloadLens:   []uint16{224}, // +16: 240
+					UniformEncapsulatedKey: true,
 				},
 			},
 		}, nil

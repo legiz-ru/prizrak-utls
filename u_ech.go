@@ -52,6 +52,11 @@ type GREASEEncryptedClientHelloExtension struct {
 	CandidatePayloadLens  []uint16 // Pre-encryption. If 0, will pick 128(+16=144)
 	payload               []byte   // payload should be calculated ONCE and stored here, HRR will reuse this
 
+	// UniformEncapsulatedKey makes an empty EncapsulatedKey uniformly random
+	// bytes, as NSS (Firefox) sends it, rather than an X25519 public key, as
+	// BoringSSL (Chrome) sends it, whose last byte never has the top bit set.
+	UniformEncapsulatedKey bool
+
 	initOnce sync.Once
 
 	UnimplementedECHExtension
@@ -106,6 +111,14 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 				g.CandidateCipherSuites[rndIndex.Int64()].AeadId,
 			}
 			// aead = hpke.AEAD(g.cipherSuite.AeadId)
+		}
+
+		if len(g.EncapsulatedKey) == 0 && g.UniformEncapsulatedKey {
+			g.EncapsulatedKey = make([]byte, 32) // Nenc of DHKEM(X25519, HKDF-SHA256)
+			if _, err := rand.Read(g.EncapsulatedKey); err != nil {
+				initErr = fmt.Errorf("tls: grease ech: failed to generate encapsulated key: %w", err)
+				return
+			}
 		}
 
 		if len(g.EncapsulatedKey) == 0 {
