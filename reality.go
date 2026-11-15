@@ -113,6 +113,12 @@ type RealityConfig struct {
 	MaxTimeDiff  time.Duration
 	ShortIds     map[[8]byte]bool
 
+	// RequireMLKEM refuses a Client Hello that does not authenticate through
+	// an X25519MLKEM768 key share, as XTLS/REALITY does since 8cdf7bf9. When
+	// false, a Client Hello that offers no X25519MLKEM768 at all may still
+	// authenticate with its single X25519 key share (realityClassicKeyShare).
+	RequireMLKEM bool
+
 	LimitFallbackUpload   RealityLimitFallback
 	LimitFallbackDownload RealityLimitFallback
 
@@ -132,6 +138,7 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		MaxClientVer:          a.MaxClientVer,
 		MaxTimeDiff:           a.MaxTimeDiff,
 		ShortIds:              a.ShortIds,
+		RequireMLKEM:          a.RequireMLKEM,
 		LimitFallbackUpload:   a.LimitFallbackUpload,
 		LimitFallbackDownload: a.LimitFallbackDownload,
 		Config:                *a.Config.Clone(),
@@ -410,20 +417,30 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
 				break
 			}
-			var peerPub []byte
+			var peerPub, peerPub2 []byte
 			for _, keyShare := range hs.clientHello.keyShares {
+				if keyShare.group == X25519MLKEM768 && len(keyShare.data) == mlkem.EncapsulationKeySize768+32 {
+					if peerPub2 != nil {
+						peerPub2 = nil // ensure fail
+						break          // ensure once
+					}
+					peerPub2 = keyShare.data[mlkem.EncapsulationKeySize768:]
+					continue // fast continue
+				}
 				if keyShare.group == X25519 && len(keyShare.data) == 32 {
 					peerPub = keyShare.data
-					break
+					break // ensure order
+				}
+			}
+			if peerPub2 == nil {
+				// A Client Hello that offers no X25519MLKEM768 at all may use
+				// its X25519 key share unless config.RequireMLKEM is set.
+				if peerPub = realityClassicKeyShare(config, hs.clientHello); peerPub == nil {
+					break // reject outdated/strange Client Hello that doesn't have X25519MLKEM768 before optional X25519
 				}
 			}
 			if peerPub == nil {
-				for _, keyShare := range hs.clientHello.keyShares {
-					if keyShare.group == X25519MLKEM768 && len(keyShare.data) == mlkem.EncapsulationKeySize768+32 {
-						peerPub = keyShare.data[mlkem.EncapsulationKeySize768:]
-						break
-					}
-				}
+				peerPub = peerPub2 // secondary choice: X25519 in X25519MLKEM768
 			}
 			for peerPub != nil {
 				if hs.AuthKey, err = curve25519.X25519(config.PrivateKey, peerPub); err != nil {
