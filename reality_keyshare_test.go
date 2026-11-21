@@ -14,8 +14,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -156,6 +159,71 @@ func TestRealityServerKeyShares(t *testing.T) {
 				t.Fatalf("client was shown the target certificate: %v, want %v", shownTarget, !test.want)
 			}
 		})
+	}
+}
+
+func TestRealityServerDoesNotLogAuthKey(t *testing.T) {
+	target, _ := startRealityTestTarget(t)
+	serverKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logMu sync.Mutex
+	var logs []string
+	config := &RealityConfig{
+		DialContext: (&net.Dialer{}).DialContext,
+		Type:        "tcp",
+		Dest:        target,
+		ServerNames: map[string]bool{"localhost": true},
+		PrivateKey:  serverKey.Bytes(),
+		ShortIds:    map[[8]byte]bool{{1, 2, 3, 4, 5, 6, 7, 8}: true},
+		Log: func(format string, values ...any) {
+			logMu.Lock()
+			defer logMu.Unlock()
+			logs = append(logs, fmt.Sprintf(format, values...))
+		},
+	}
+	config.SessionTicketsDisabled = true
+	runRealityTestHandshake(t, config, serverKey.PublicKey(), HelloChrome_Auto, nil, [3]byte{26, 11, 10}, [8]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	logMu.Lock()
+	defer logMu.Unlock()
+	joined := strings.Join(logs, "\n")
+	if strings.Contains(joined, "AuthKey") {
+		t.Fatalf("REALITY logs expose authentication key material: %s", joined)
+	}
+	if !strings.Contains(joined, "AEAD: *gcm.GCM") {
+		t.Fatalf("REALITY logs lost the non-secret cipher diagnostic: %s", joined)
+	}
+}
+
+func TestRealityServerHonorsContextBeforeClientHello(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	targetConn, targetPeer := net.Pipe()
+	defer clientConn.Close()
+	defer targetPeer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	config := &RealityConfig{
+		DialContext: func(context.Context, string, string) (net.Conn, error) { return targetConn, nil },
+		Type:        "tcp",
+		Dest:        "unused",
+		ServerNames: map[string]bool{"localhost": true},
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := RealityServer(ctx, serverConn, config)
+		result <- err
+	}()
+	cancel()
+	select {
+	case <-result:
+	case <-time.After(500 * time.Millisecond):
+		_ = clientConn.Close()
+		_ = targetPeer.Close()
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("RealityServer remained blocked after its context was cancelled")
 	}
 }
 

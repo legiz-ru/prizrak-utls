@@ -385,6 +385,16 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 		conn.Close()
 		return nil, errors.New("REALITY: failed to dial dest: " + err.Error())
 	}
+	stopContextWatcher := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+			_ = target.Close()
+		case <-stopContextWatcher:
+		}
+	}()
+	defer close(stopContextWatcher)
 
 	underlying := conn
 
@@ -400,7 +410,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				},
 				config: &config.Config,
 			},
-			ctx: context.Background(),
+			ctx: ctx,
 		},
 		Config: config,
 	}
@@ -413,7 +423,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	go func() {
 		for {
 			mutex.Lock()
-			hs.clientHello, _, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
+			hs.clientHello, _, err = hs.c.readClientHello(ctx)
 			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
 				break
 			}
@@ -452,7 +462,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				block, _ := aes.NewCipher(hs.AuthKey)
 				aead, _ := cipher.NewGCM(block)
 				if config.Log != nil {
-					config.Log("REALITY remoteAddr: %v hs.c.AuthKey[:16]: %v AEAD: %T", remoteAddr, hs.AuthKey[:16], aead)
+					config.Log("REALITY remoteAddr: %v AEAD: %T", remoteAddr, aead)
 				}
 				ciphertext := make([]byte, 32)
 				plainText := make([]byte, 32)
