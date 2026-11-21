@@ -13,7 +13,7 @@ import (
 	"hash"
 	"log"
 
-	"github.com/refraction-networking/utls/internal/helper"
+	"github.com/metacubex/utls/internal/helper"
 	"golang.org/x/crypto/cryptobyte"
 )
 
@@ -41,6 +41,7 @@ const (
 	utlsFakeExtensionCustom             uint16 = 1234   // not IANA assigned, for ALPS
 	utlsExtensionECH                    uint16 = 0xfe0d // draft-ietf-tls-esni-17
 	utlsExtensionECHOuterExtensions     uint16 = 0xfd00 // draft-ietf-tls-esni-17
+	utlsExtensionTrustAnchors           uint16 = 0xca34 // draft-ietf-tls-trust-anchor-ids
 
 	// extensions with 'fake' prefix break connection, if server echoes them back
 	fakeExtensionEncryptThenMAC       uint16 = 22
@@ -602,7 +603,7 @@ var (
 	HelloRandomizedNoALPN = ClientHelloID{helloRandomizedNoALPN, helloAutoVers, nil, nil}
 
 	// The rest will will parrot given browser.
-	HelloFirefox_Auto = HelloFirefox_148
+	HelloFirefox_Auto = HelloFirefox_160
 	HelloFirefox_55   = ClientHelloID{helloFirefox, "55", nil, nil}
 	HelloFirefox_56   = ClientHelloID{helloFirefox, "56", nil, nil}
 	HelloFirefox_63   = ClientHelloID{helloFirefox, "63", nil, nil}
@@ -612,8 +613,12 @@ var (
 	HelloFirefox_105  = ClientHelloID{helloFirefox, "105", nil, nil}
 	HelloFirefox_120  = ClientHelloID{helloFirefox, "120", nil, nil}
 	HelloFirefox_148  = ClientHelloID{helloFirefox, "148", nil, nil}
+	HelloFirefox_156  = ClientHelloID{helloFirefox, "156", nil, nil}
+	// Firefox 160.0 on macOS, from captures of the browser. Its fresh
+	// ClientHello is the same as Firefox 156's.
+	HelloFirefox_160 = ClientHelloID{helloFirefox, "160", nil, nil}
 
-	HelloChrome_Auto        = HelloChrome_133
+	HelloChrome_Auto        = HelloChrome_155
 	HelloChrome_58          = ClientHelloID{helloChrome, "58", nil, nil}
 	HelloChrome_62          = ClientHelloID{helloChrome, "62", nil, nil}
 	HelloChrome_70          = ClientHelloID{helloChrome, "70", nil, nil}
@@ -645,6 +650,9 @@ var (
 	HelloChrome_131 = ClientHelloID{helloChrome, "131", nil, nil}
 	// Chrome w/ New ALPS codepoint
 	HelloChrome_133 = ClientHelloID{helloChrome, "133", nil, nil}
+	// Chrome 155.0.8059.40 on macOS, with ML-DSA signatures and a snapshot of
+	// the Chrome Root Store trust anchor IDs. See testdata/chrome155_clienthello.md.
+	HelloChrome_155 = ClientHelloID{helloChrome, "155", nil, nil}
 
 	HelloIOS_Auto = HelloIOS_14
 	HelloIOS_11_1 = ClientHelloID{helloIOS, "111", nil, nil} // legacy "111" means 11.1

@@ -5,9 +5,10 @@
 package tls
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"slices"
+	"golang.org/x/exp/slices"
 	"strings"
 
 	"golang.org/x/crypto/cryptobyte"
@@ -242,8 +243,9 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 		}
 	}
 	if len(m.alpnProtocols) > 0 {
-		// ALPN extension copy is skipped because in ECH inner, the ALPN might be different
-		if echInner && false {
+		// Only compress ALPN for standard ClientHellos, where inner and outer match.
+		// Custom ClientHellos may use different inner and outer ALPNs.
+		if echInner && outerExts == nil {
 			echOuterExts = append(echOuterExts, extensionALPN)
 		} else {
 			// RFC 7301, Section 3.1
@@ -321,15 +323,12 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 	// [uTLS SECTION BEGIN]
 	// reorder OuterExtensions according to their order in the spec
 	if echInner && outerExts != nil {
-		echOuterExtsReordered := slices.Collect(func(yield func(uint16) bool) {
-			for _, ext := range outerExts {
-				if slices.Contains(echOuterExts, ext) {
-					if !yield(ext) {
-						return
-					}
-				}
+		echOuterExtsReordered := make([]uint16, 0, len(outerExts))
+		for _, ext := range outerExts {
+			if slices.Contains(echOuterExts, ext) {
+				echOuterExtsReordered = append(echOuterExtsReordered, ext)
 			}
-		})
+		}
 		echOuterExts = echOuterExtsReordered
 	}
 	// [uTLS SECTION END]
@@ -343,7 +342,8 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 			})
 		})
 	}
-	if len(m.pskIdentities) > 0 { // pre_shared_key must be the last extension
+	// pre_shared_key must be the last extension
+	if len(m.pskIdentities) > 0 && (echInner || len(m.encryptedClientHello) == 0 || bytes.Equal(m.encryptedClientHello, []byte{byte(innerECHExt)})) {
 		// RFC 8446, Section 4.2.11
 		exts.AddUint16(extensionPreSharedKey)
 		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
@@ -1048,6 +1048,7 @@ type encryptedExtensionsMsg struct {
 	quicTransportParameters []byte
 	earlyData               bool
 	echRetryConfigs         []byte
+	serverNameAck           bool
 
 	utls utlsEncryptedExtensionsMsgExtraFields // [uTLS]
 }
@@ -1085,6 +1086,10 @@ func (m *encryptedExtensionsMsg) marshal() ([]byte, error) {
 					b.AddBytes(m.echRetryConfigs)
 				})
 			}
+			if m.serverNameAck {
+				b.AddUint16(extensionServerName)
+				b.AddUint16(0) // empty extension_data
+			}
 		})
 	})
 
@@ -1101,6 +1106,7 @@ func (m *encryptedExtensionsMsg) unmarshal(data []byte) bool {
 		return false
 	}
 
+	seenExts := make(map[uint16]bool)
 	for !extensions.Empty() {
 		var extension uint16
 		var extData cryptobyte.String
@@ -1108,6 +1114,11 @@ func (m *encryptedExtensionsMsg) unmarshal(data []byte) bool {
 			!extensions.ReadUint16LengthPrefixed(&extData) {
 			return false
 		}
+
+		if seenExts[extension] {
+			return false
+		}
+		seenExts[extension] = true
 
 		switch extension {
 		case extensionALPN:
@@ -1134,6 +1145,11 @@ func (m *encryptedExtensionsMsg) unmarshal(data []byte) bool {
 			if !extData.CopyBytes(m.echRetryConfigs) {
 				return false
 			}
+		case extensionServerName:
+			if len(extData) != 0 {
+				return false
+			}
+			m.serverNameAck = true
 		default:
 			// [UTLS SECTION START]
 			if !m.utlsUnmarshal(extension, extData) {
@@ -1842,7 +1858,7 @@ func (m *certificateRequestMsg) unmarshal(data []byte) bool {
 		}
 		sigAndHashLen := uint16(data[0])<<8 | uint16(data[1])
 		data = data[2:]
-		if sigAndHashLen&1 != 0 {
+		if sigAndHashLen&1 != 0 || sigAndHashLen == 0 {
 			return false
 		}
 		if len(data) < int(sigAndHashLen) {

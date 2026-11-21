@@ -20,10 +20,8 @@ type UQUICConn struct {
 	sessionTicketSent bool
 }
 
-// QUICClient returns a new TLS client side connection using QUICTransport as the
+// UQUICClient returns a new TLS client side connection using QUICTransport as the
 // underlying transport. The config cannot be nil.
-//
-// The config's MinVersion must be at least TLS 1.3.
 func UQUICClient(config *QUICConfig, clientHelloID ClientHelloID) *UQUICConn {
 	return newUQUICConn(UClient(nil, config.TLSConfig, clientHelloID), config)
 }
@@ -33,6 +31,7 @@ func newUQUICConn(uconn *UConn, config *QUICConfig) *UQUICConn {
 		signalc:             make(chan struct{}),
 		blockedc:            make(chan struct{}),
 		enableSessionEvents: config.EnableSessionEvents,
+		clientHelloInfoConn: config.ClientHelloInfoConn,
 	}
 	uconn.quic.events = uconn.quic.eventArr[:0]
 	return &UQUICConn{
@@ -49,9 +48,6 @@ func (q *UQUICConn) Start(ctx context.Context) error {
 		return quicError(errors.New("tls: Start called more than once"))
 	}
 	q.conn.quic.started = true
-	if q.conn.config.MinVersion < VersionTLS13 {
-		return quicError(errors.New("tls: Config MinVersion must be at least TLS 1.3"))
-	}
 	go q.conn.HandshakeContext(ctx)
 	if _, ok := <-q.conn.quic.blockedc; !ok {
 		return q.conn.handshakeErr
@@ -77,6 +73,15 @@ func (q *UQUICConn) NextEvent() QUICEvent {
 		<-qs.signalc
 		<-qs.blockedc
 	}
+	if err := q.conn.handshakeErr; err != nil {
+		if qs.errorReturned {
+			return QUICEvent{Kind: QUICNoEvent}
+		}
+		qs.errorReturned = true
+		qs.events = nil
+		qs.nextEvent = 0
+		return QUICEvent{Kind: QUICErrorEvent, Err: q.conn.handshakeErr}
+	}
 	if qs.nextEvent >= len(qs.events) {
 		qs.events = qs.events[:0]
 		qs.nextEvent = 0
@@ -90,10 +95,11 @@ func (q *UQUICConn) NextEvent() QUICEvent {
 
 // Close closes the connection and stops any in-progress handshake.
 func (q *UQUICConn) Close() error {
-	if q.conn.quic.cancel == nil {
+	if q.conn.quic.ctx == nil {
 		return nil // never started
 	}
 	q.conn.quic.cancel()
+	<-q.conn.quic.signalc
 	for range q.conn.quic.blockedc {
 		// Wait for the handshake goroutine to return.
 	}
@@ -188,14 +194,16 @@ func (q *UQUICConn) SetTransportParameters(params []byte) {
 	if params == nil {
 		params = []byte{}
 	}
-	q.conn.quic.transportParams = params // this won't be used for building ClientHello when using a preset
+	q.conn.quic.transportParams = params
 
-	// // instead, we set the transport parameters hold by the ClientHello
-	// for _, ext := range q.conn.Extensions {
-	// 	if qtp, ok := ext.(*QUICTransportParametersExtension); ok {
-	// 		qtp.TransportParametersExtData = params
-	// 	}
-	// }
+	// A ClientHello built from a preset marshals its own
+	// QUICTransportParametersExtension, which ApplyPreset cloned from the
+	// caller's spec. Put the parameters there, so they reach the peer.
+	for _, ext := range q.conn.Extensions {
+		if qtp, ok := ext.(*QUICTransportParametersExtension); ok {
+			qtp.marshalResult = append([]byte{}, params...)
+		}
+	}
 
 	if q.conn.quic.started {
 		<-q.conn.quic.signalc

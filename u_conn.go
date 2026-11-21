@@ -12,9 +12,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"golang.org/x/exp/slices"
 	"hash"
 	"net"
-	"slices"
 	"strconv"
 
 	"golang.org/x/crypto/cryptobyte"
@@ -38,7 +38,7 @@ type UConn struct {
 
 	HandshakeState PubClientHandshakeState
 
-	greaseSeed [ssl_grease_last_index]uint16
+	greaseSeed [ssl_grease_seed_count]uint16
 
 	omitSNIExtension bool
 
@@ -328,32 +328,18 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 	// this cancellation. In the former case, we need to close the connection.
 	defer cancel()
 
-	// Start the "interrupter" goroutine, if this context might be canceled.
-	// (The background context cannot).
-	//
-	// The interrupter goroutine waits for the input context to be done and
-	// closes the connection if this happens before the function returns.
 	if c.quic != nil {
-		c.quic.cancelc = handshakeCtx.Done()
+		c.quic.ctx = handshakeCtx
 		c.quic.cancel = cancel
 	} else if ctx.Done() != nil {
-		done := make(chan struct{})
-		interruptRes := make(chan error, 1)
+		// Close the connection if ctx is canceled before the function returns.
+		stop := contextAfterFunc(ctx, func() {
+			_ = c.conn.Close()
+		})
 		defer func() {
-			close(done)
-			if ctxErr := <-interruptRes; ctxErr != nil {
+			if !stop() {
 				// Return context error to user.
-				ret = ctxErr
-			}
-		}()
-		go func() {
-			select {
-			case <-handshakeCtx.Done():
-				// Close the connection, discarding the error
-				_ = c.conn.Close()
-				interruptRes <- handshakeCtx.Err()
-			case <-done:
-				interruptRes <- nil
+				ret = ctx.Err()
 			}
 		}()
 	}
@@ -372,14 +358,18 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 	defer c.in.Unlock()
 
 	// [uTLS section begins]
+	handshakeFn := c.handshakeFn
 	if c.isClient {
-		err := c.BuildHandshakeState()
-		if err != nil {
-			return err
+		if err := c.BuildHandshakeState(); err != nil {
+			if c.quic == nil {
+				return err
+			}
+			// Let QUIC build errors go through the normal handshake cleanup.
+			handshakeFn = func(context.Context) error { return err }
 		}
 	}
+	c.handshakeErr = handshakeFn(handshakeCtx)
 	// [uTLS section ends]
-	c.handshakeErr = c.handshakeFn(handshakeCtx)
 	if c.handshakeErr == nil {
 		c.handshakes++
 	} else {
@@ -401,11 +391,13 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 			// Provide the 1-RTT read secret now that the handshake is complete.
 			// The QUIC layer MUST NOT decrypt 1-RTT packets prior to completing
 			// the handshake (RFC 9001, Section 5.7).
-			c.quicSetReadSecret(QUICEncryptionLevelApplication, c.cipherSuite, c.in.trafficSecret)
+			if err := c.quicSetReadSecret(QUICEncryptionLevelApplication, c.cipherSuite, c.in.trafficSecret); err != nil {
+				return err
+			}
 		} else {
-			var a alert
 			c.out.Lock()
-			if !errors.As(c.out.err, &a) {
+			a, ok := errorsAsType[alert](c.out.err)
+			if !ok {
 				a = alertInternalError
 			}
 			c.out.Unlock()
@@ -505,7 +497,7 @@ func (uconn *UConn) extensionsList() []uint16 {
 
 func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech *echClientContext, useKey bool) error {
 	// This function is mostly copied from
-	// https://github.com/refraction-networking/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L408
+	// https://github.com/metacubex/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L408
 	var encapKey []byte
 	if useKey {
 		encapKey = ech.encapsulatedKey
@@ -515,6 +507,7 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 	if err != nil {
 		return err
 	}
+	ech.encodedInner = bytes.Clone(encodedInner)
 
 	encryptedLen := len(encodedInner) + 16
 	outerECHExt, err := generateOuterECHExt(ech.config.ConfigID, ech.kdfID, ech.aeadID, encapKey, make([]byte, encryptedLen))
@@ -530,6 +523,7 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 		return fmt.Errorf("extension satisfying EncryptedClientHelloExtension not present")
 	}
 	oldExt := uconn.Extensions[echExtIdx]
+	defer func() { uconn.Extensions[echExtIdx] = oldExt }()
 
 	uconn.Extensions[echExtIdx] = &GenericExtension{
 		Id:   extensionEncryptedClientHello,
@@ -559,13 +553,21 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 		return err
 	}
 
-	uconn.Extensions[echExtIdx] = oldExt
 	return nil
 
 }
 
 func (uconn *UConn) MarshalClientHello() error {
 	if len(uconn.config.EncryptedClientHelloConfigList) > 0 {
+		// Real PSKs must only appear in ClientHelloInner. The custom PSK
+		// controller patches binders in the outer hello, so reject this
+		// combination until it supports the inner transcript. GREASE ECH
+		// does not enter this path and can still be combined with PSK.
+		for _, ext := range uconn.Extensions {
+			if psk, ok := ext.(PreSharedKeyExtension); ok && psk.Len() > 0 {
+				return errors.New("tls: PSK resumption with a custom ECH ClientHello is not supported")
+			}
+		}
 		inner, _, ech, err := uconn.makeClientHello()
 		if err != nil {
 			return err
@@ -579,7 +581,9 @@ func (uconn *UConn) MarshalClientHello() error {
 
 		ech.innerHello = inner
 
-		uconn.computeAndUpdateOuterECHExtension(inner, ech, true)
+		if err := uconn.computeAndUpdateOuterECHExtension(inner, ech, true); err != nil {
+			return err
+		}
 
 		uconn.echCtx = ech
 		return nil

@@ -8,8 +8,8 @@ import (
 	"math/big"
 	"sync"
 
-	"github.com/refraction-networking/utls/dicttls"
-	"github.com/refraction-networking/utls/internal/hpke"
+	"github.com/metacubex/utls/dicttls"
+	"github.com/metacubex/utls/hpke"
 	"golang.org/x/crypto/cryptobyte"
 )
 
@@ -51,6 +51,11 @@ type GREASEEncryptedClientHelloExtension struct {
 	EncapsulatedKey       []byte   // if empty, will generate random bytes
 	CandidatePayloadLens  []uint16 // Pre-encryption. If 0, will pick 128(+16=144)
 	payload               []byte   // payload should be calculated ONCE and stored here, HRR will reuse this
+
+	// UniformEncapsulatedKey makes an empty EncapsulatedKey uniformly random
+	// bytes, as NSS (Firefox) sends it, rather than an X25519 public key, as
+	// BoringSSL (Chrome) sends it, whose last byte never has the top bit set.
+	UniformEncapsulatedKey bool
 
 	initOnce sync.Once
 
@@ -108,23 +113,55 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			// aead = hpke.AEAD(g.cipherSuite.AeadId)
 		}
 
-		if len(g.EncapsulatedKey) == 0 {
-			kem := uint16(defaultHpkeKem)
+		if len(g.EncapsulatedKey) == 0 && g.UniformEncapsulatedKey {
+			g.EncapsulatedKey = make([]byte, 32) // Nenc of DHKEM(X25519, HKDF-SHA256)
+			if _, err := rand.Read(g.EncapsulatedKey); err != nil {
+				initErr = fmt.Errorf("tls: grease ech: failed to generate encapsulated key: %w", err)
+				return
+			}
+		}
 
-			echPK, err := hpke.ParseHPKEPublicKey(uint16(kem), dummyX25519PublicKey)
+		if len(g.EncapsulatedKey) == 0 {
+			// kem := uint16(defaultHpkeKem)
+
+			// echPK, err := hpke.ParseHPKEPublicKey(uint16(kem), dummyX25519PublicKey)
+			// if err != nil {
+			// 	initErr = fmt.Errorf("tls: grease ech: failed to parse dummy public key: %w", err)
+			// 	return
+			// }
+			// suite := echCipher{
+			// 	KDFID:  defaultHpkeKdf,
+			// 	AEADID: defaultHpkeAead,
+			// }
+			// g.EncapsulatedKey, _, err = hpke.SetupSender(kem, suite.KDFID, suite.AEADID, echPK, []byte{})
+			// if err != nil {
+			// 	initErr = fmt.Errorf("tls: grease ech: failed to setup encapsulated key: %w", err)
+			// 	return
+			// }
+
+			kem, err := hpke.NewKEM(defaultHpkeKem)
+			if err != nil {
+				initErr = fmt.Errorf("tls: grease ech: failed to create kem: %w", err)
+				return
+			}
+			publicKey, err := kem.NewPublicKey(dummyX25519PublicKey)
 			if err != nil {
 				initErr = fmt.Errorf("tls: grease ech: failed to parse dummy public key: %w", err)
 				return
 			}
-			suite := echCipher{
-				KDFID:  defaultHpkeKdf,
-				AEADID: defaultHpkeAead,
-			}
-			g.EncapsulatedKey, _, err = hpke.SetupSender(kem, suite.KDFID, suite.AEADID, echPK, []byte{})
+
+			kdf, err := hpke.NewKDF(defaultHpkeKdf)
 			if err != nil {
-				initErr = fmt.Errorf("tls: grease ech: failed to setup encapsulated key: %w", err)
-				return
+				initErr = fmt.Errorf("tls: grease ech: failed to create kdf: %w", err)
 			}
+
+			aead, err := hpke.NewAEAD(defaultHpkeAead)
+			if err != nil {
+				initErr = fmt.Errorf("tls: grease ech: failed to create aead: %w", err)
+			}
+
+			g.EncapsulatedKey, _, err = hpke.NewSender(publicKey, kdf, aead, []byte{})
+
 		}
 
 		if len(g.payload) == 0 {

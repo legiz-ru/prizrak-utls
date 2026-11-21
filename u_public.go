@@ -7,10 +7,11 @@ package tls
 import (
 	"crypto"
 	"crypto/ecdh"
-	"crypto/mlkem"
 	"crypto/x509"
 	"hash"
 	"time"
+
+	"github.com/metacubex/utls/mlkem"
 )
 
 // ClientHandshakeState includes both TLS 1.3-only and TLS 1.2-only states,
@@ -37,16 +38,6 @@ type PubClientHandshakeState struct {
 
 // TLS 1.3 only
 type TLS13OnlyState struct {
-	// Deprecated: Use KeyShareKeys instead. KeyShareKeys will take precedence if both are set.
-	// Support may be removed in the future.
-	EcdheKey *ecdh.PrivateKey
-	// Deprecated: Use KeyShareKeys instead. This variable is no longer used.
-	// Will be removed in the future.
-	KeySharesParams *KeySharesParameters
-	// Deprecated: Use KeyShareKeys instead. This variable is no longer used.
-	// Will be removed in the future.
-	KEMKey *KemPrivateKey
-
 	KeyShareKeys  *KeySharePrivateKeys
 	Suite         *PubCipherSuiteTLS13
 	EarlySecret   []byte
@@ -67,12 +58,6 @@ type TLS12OnlyState struct {
 func (chs *TLS13OnlyState) private13KeyShareKeys() *keySharePrivateKeys {
 	if chs.KeyShareKeys != nil {
 		return chs.KeyShareKeys.ToPrivate()
-	}
-
-	if chs.EcdheKey != nil {
-		return &keySharePrivateKeys{
-			ecdhe: chs.EcdheKey,
-		}
 	}
 
 	return nil
@@ -925,10 +910,20 @@ func (kpk *kemPrivateKey) ToPublic() *KemPrivateKey {
 }
 
 type KeySharePrivateKeys struct {
-	CurveID    CurveID
-	Ecdhe      *ecdh.PrivateKey
-	Mlkem      *mlkem.DecapsulationKey768
-	MlkemEcdhe *ecdh.PrivateKey
+	// CurveID    CurveID
+	Ecdhe         *ecdh.PrivateKey
+	Mlkem         mlkem.Decapsulator
+	MlkemEcdhe    *ecdh.PrivateKey
+	EcdheFallback map[CurveID]*ecdh.PrivateKey // [uTLS] keys of the classical key shares after the first, by group
+}
+
+// [uTLS] addEcdheFallback keeps the private key of a classical key share
+// sent after the first one.
+func (ksp *KeySharePrivateKeys) addEcdheFallback(curveID CurveID, key *ecdh.PrivateKey) {
+	if ksp.EcdheFallback == nil {
+		ksp.EcdheFallback = make(map[CurveID]*ecdh.PrivateKey)
+	}
+	ksp.EcdheFallback[curveID] = key
 }
 
 func (ksp *KeySharePrivateKeys) ToPrivate() *keySharePrivateKeys {
@@ -936,10 +931,11 @@ func (ksp *KeySharePrivateKeys) ToPrivate() *keySharePrivateKeys {
 		return nil
 	}
 	return &keySharePrivateKeys{
-		curveID:    ksp.CurveID,
-		ecdhe:      ksp.Ecdhe,
-		mlkem:      ksp.Mlkem,
-		mlkemEcdhe: ksp.MlkemEcdhe,
+		// curveID:    ksp.CurveID,
+		ecdhe:         ksp.Ecdhe,
+		mlkem:         ksp.Mlkem,
+		mlkemEcdhe:    ksp.MlkemEcdhe,
+		ecdheFallback: ksp.EcdheFallback,
 	}
 }
 
@@ -948,9 +944,10 @@ func (ksp *keySharePrivateKeys) ToPublic() *KeySharePrivateKeys {
 		return nil
 	}
 	return &KeySharePrivateKeys{
-		CurveID:    ksp.curveID,
-		Ecdhe:      ksp.ecdhe,
-		Mlkem:      ksp.mlkem,
-		MlkemEcdhe: ksp.mlkemEcdhe,
+		// CurveID:    ksp.curveID,
+		Ecdhe:         ksp.ecdhe,
+		Mlkem:         ksp.mlkem,
+		MlkemEcdhe:    ksp.mlkemEcdhe,
+		EcdheFallback: ksp.ecdheFallback,
 	}
 }
